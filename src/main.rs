@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
 use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -27,10 +27,13 @@ use crate::vendor::xiaomi::hardware::touchgesture::ITouchGesture::{
 const SERVICE_NAME: &str = "vendor.xiaomi.hardware.touchgesture.ITouchGesture/default";
 const GESTURE_NODE: &str = "/proc/gesture_function";
 const SCREEN_STATE_PROP: &str = "debug.tracing.screen_state";
-const FTS_NODE: &str = "/sys/class/input/event4/device/device/fts_gesture_mode";
-const TOUCH_NODE: &str = "/dev/input/event4";
+const FTS_NODE: &str =
+    "/sys/devices/platform/soc/11010000.spi1/spi_master/spi1/spi1.0/fts_gesture_mode";
+const WAKE_KEY: &str = "224";
+const WAKE_GESTURE_KEY: u32 = 0x00c6;
+const WAKE_STAMP: &str = "/data/adb/fod/dt2w_last_wake";
 const WAKE_GESTURE: &str = "cc1";
-const REASSERT_MS: u64 = 3_000;
+const REASSERT_MS: u64 = 2_000;
 
 const SCREEN_OFF: i32 = 0;
 const SCREEN_OFF_AOD: i32 = 1;
@@ -41,6 +44,21 @@ const SCREEN_DOZE_SUSPEND: i32 = 4;
 static ENABLED: AtomicI32 = AtomicI32::new(0);
 static SCREEN_STATE: AtomicI32 = AtomicI32::new(SCREEN_ON);
 static FOD_PRESSED: AtomicI32 = AtomicI32::new(0);
+static TOUCH_X: AtomicI64 = AtomicI64::new(-1);
+static TOUCH_Y: AtomicI64 = AtomicI64::new(-1);
+
+const FOD_CENTER_X: i64 = 540;
+const FOD_CENTER_Y: i64 = 2172;
+const FOD_RADIUS: i64 = 170;
+
+/// mtk-tpd reports 16x the panel coordinates. Only a touch inside the FOD
+/// circle counts as "sensor pressed"; a plain BTN_TOUCH elsewhere must not
+/// make this service yield the node to the FOD HAL.
+fn in_fod_area(x_raw: i64, y_raw: i64) -> bool {
+    let dx = x_raw / 16 - FOD_CENTER_X;
+    let dy = y_raw / 16 - FOD_CENTER_Y;
+    dx * dx + dy * dy <= FOD_RADIUS * FOD_RADIUS
+}
 
 // ------------------------------------------------------------ Bionic prop FFI
 
@@ -234,10 +252,57 @@ fn apply(force: bool) {
         }
         Err(e) => tracing::warn!("[Gesture] write {WAKE_GESTURE} failed: {e}"),
     }
+
+    // The FTS controller also needs its own gesture mode armed, otherwise
+    // KEY 0xC6 is never emitted while the panel is in doze/AOD.
+    if let Err(e) = std::fs::write(FTS_NODE, b"1\n") {
+        tracing::warn!("[Gesture] arm {FTS_NODE} failed: {e}");
+    }
 }
 
 static APPLIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static AIDL_OVERRIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_WAKE_SEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_sec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn find_touch_node() -> Option<String> {
+    for entry in std::fs::read_dir("/sys/class/input").ok()?.flatten() {
+        let name_path = entry.path().join("device/name");
+        let name = std::fs::read_to_string(name_path).unwrap_or_default();
+        let name = name.trim();
+        if name == "mtk-tpd" || name.contains("touch") {
+            let event = entry.file_name().to_string_lossy().into_owned();
+            return Some(format!("/dev/input/{event}"));
+        }
+    }
+    None
+}
+
+/// FocalTech emits KEY 0xC6 on a double tap while doze. Turn that into a real
+/// wake key, with a 1s debounce persisted so a getevent restart cannot repeat.
+fn maybe_wake() {
+    let now = now_sec();
+    let last = LAST_WAKE_SEC.load(Ordering::SeqCst);
+    if now.saturating_sub(last) < 1 {
+        return;
+    }
+    LAST_WAKE_SEC.store(now, Ordering::SeqCst);
+    let _ = std::fs::write(WAKE_STAMP, now.to_string());
+    if let Err(e) = Command::new("/system/bin/input")
+        .args(["keyevent", WAKE_KEY])
+        .status()
+    {
+        tracing::warn!("[Gesture] keyevent {WAKE_KEY} failed: {e}");
+    } else {
+        tracing::info!("[Gesture] wake key {WAKE_KEY} injected");
+    }
+}
 
 // --------------------------------------------------------------- AIDL service
 
@@ -303,8 +368,16 @@ fn spawn_screen_watcher(tx: Sender<()>) {
 
 fn spawn_input_watcher(tx: Sender<()>) {
     std::thread::spawn(move || loop {
+        let node = match find_touch_node() {
+            Some(n) => n,
+            None => {
+                tracing::warn!("[Input] touch node not found");
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
         let child = Command::new("/system/bin/getevent")
-            .args(["-q", TOUCH_NODE])
+            .args(["-q", &node])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
@@ -328,7 +401,28 @@ fn spawn_input_watcher(tx: Sender<()>) {
                 let ty = u32::from_str_radix(p[0], 16).unwrap_or(0);
                 let code = u32::from_str_radix(p[1], 16).unwrap_or(0);
                 let val = u32::from_str_radix(p[2], 16).unwrap_or(0) as i32;
-                if ty != 0x01 || !(code == 0xc3 || code == 0x152 || code == 0x14a) {
+                if ty == 0x03 {
+                    match code {
+                        0x35 => TOUCH_X.store(val as i64, Ordering::SeqCst),
+                        0x36 => TOUCH_Y.store(val as i64, Ordering::SeqCst),
+                        _ => {}
+                    }
+                    continue;
+                }
+                if ty != 0x01 {
+                    continue;
+                }
+                if ty == 0x01 && code == WAKE_GESTURE_KEY && val == 1 {
+                    maybe_wake();
+                    continue;
+                }
+                let is_fod_key = code == 0xc3 || code == 0x152;
+                let is_touch_in_fod = code == 0x14a
+                    && in_fod_area(
+                        TOUCH_X.load(Ordering::SeqCst),
+                        TOUCH_Y.load(Ordering::SeqCst),
+                    );
+                if !is_fod_key && !is_touch_in_fod {
                     continue;
                 }
                 let down = if val > 0 { 1 } else { 0 };
@@ -390,6 +484,11 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(SCREEN_ON);
     SCREEN_STATE.store(initial_state, Ordering::SeqCst);
     ENABLED.store(if current_enabled() { 1 } else { 0 }, Ordering::SeqCst);
+    if let Ok(stamp) = std::fs::read_to_string(WAKE_STAMP) {
+        if let Ok(sec) = stamp.trim().parse::<u64>() {
+            LAST_WAKE_SEC.store(sec, Ordering::SeqCst);
+        }
+    }
 
     let (tx, rx) = channel::<()>();
     spawn_screen_watcher(tx.clone());

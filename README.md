@@ -12,11 +12,20 @@ juga dipakai FOD HAL untuk `fp1` saat jari menekan sensor sidik jari.
 
 Aturan yang dipakai:
 
-- `gesture_wakeup=1` dan layar bukan ON (`0/1/3/4`) → tulis `cc1`.
+- `gesture_wakeup=1` dan layar bukan ON (`0/1/3/4`) → tulis `cc1` ke
+  `/proc/gesture_function` **dan** `1` ke node FTS `fts_gesture_mode`.
+  Keduanya diperlukan supaya controller mengeluarkan KEY `0xC6`.
 - Layar ON → tidak menulis apa-apa, biarkan `fp1` dari FOD HAL.
 - Jari menekan sensor FOD → service berhenti menulis, FOD HAL menang.
 - Jari lepas dan layar masih doze → `cc1` ditulis ulang.
-- Service menulis ulang `cc1` tiap 3 detik untuk mengalahkan writer lain.
+- Service menulis ulang `cc1` tiap 2 detik untuk mengalahkan writer lain.
+- Saat KEY `0xC6` (double tap) muncul, service menyuntik `input keyevent 224`
+  dengan debounce 1 detik. Timestamp disimpan di `/data/adb/fod/dt2w_last_wake`
+  supaya tidak dobel setelah `getevent` restart.
+
+Deteksi jari dan gesture memakai node touch yang dicari otomatis dari
+`/sys/class/input/event*/device/name` (`mtk-tpd` / `*touch*`), bukan hardcode
+`event4`.
 
 Status layar diambil dari `debug.tracing.screen_state` via Bionic futex.
 Fallback: `Reg(0xD0)` di `/sys/class/input/event4/device/device/fts_gesture_mode`
