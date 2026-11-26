@@ -1,0 +1,4 @@
+service xiaomi-touchgesture /vendor/bin/xiaomi_touchgesture
+    class late_start
+    user root
+    group root system
